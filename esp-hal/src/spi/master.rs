@@ -519,8 +519,15 @@ where
     }
 
     /// Sends `words` to the slave. Returns the `words` received from the slave
+    #[cfg_attr(place_spi_driver_in_ram, ram)]
     pub fn transfer<'w>(&mut self, words: &'w mut [u8]) -> Result<&'w [u8], Error> {
-        self.spi.transfer(words)
+        for chunk in words.chunks_mut(FIFO_SIZE) {
+            self.spi.write_bytes(chunk)?;
+            self.spi.flush()?;
+            self.spi.read_bytes_from_fifo(chunk)?;
+        }
+
+        Ok(words)
     }
 }
 
@@ -801,9 +808,20 @@ where
             return Err(Error::Unsupported);
         }
 
-        self.spi
-            .init_spi_data_mode(cmd.mode(), address.mode(), data_mode);
-        self.spi.read_bytes_half_duplex(cmd, address, dummy, buffer)
+        self.spi.setup_half_duplex(
+            false,
+            cmd,
+            address,
+            false,
+            dummy,
+            buffer.is_empty(),
+            data_mode,
+        );
+
+        self.spi.configure_datalen(buffer.len(), 0);
+        self.spi.start_operation();
+        self.spi.flush()?;
+        self.spi.read_bytes_from_fifo(buffer)
     }
 
     fn write(
@@ -818,10 +836,24 @@ where
             return Err(Error::FifoSizeExeeded);
         }
 
-        self.spi
-            .init_spi_data_mode(cmd.mode(), address.mode(), data_mode);
-        self.spi
-            .write_bytes_half_duplex(cmd, address, dummy, buffer)
+        self.spi.setup_half_duplex(
+            true,
+            cmd,
+            address,
+            false,
+            dummy,
+            buffer.is_empty(),
+            data_mode,
+        );
+
+        if !buffer.is_empty() {
+            // re-using the full-duplex write here
+            self.spi.write_bytes(buffer)?;
+        } else {
+            self.spi.start_operation();
+        }
+
+        self.spi.flush()
     }
 }
 
@@ -1316,55 +1348,15 @@ mod dma {
                 return Err((Error::MaxDmaTransferSizeExceeded, self, buffer));
             }
 
-            self.spi.init_half_duplex(
+            self.spi.setup_half_duplex(
                 false,
-                !cmd.is_none(),
-                !address.is_none(),
+                cmd,
+                address,
                 false,
-                dummy != 0,
+                dummy,
                 bytes_to_read == 0,
+                data_mode,
             );
-            self.spi
-                .init_spi_data_mode(cmd.mode(), address.mode(), data_mode);
-
-            // set cmd, address, dummy cycles
-            let reg_block = self.spi.register_block();
-            if !cmd.is_none() {
-                reg_block.user2().modify(|_, w| unsafe {
-                    w.usr_command_bitlen()
-                        .bits((cmd.width() - 1) as u8)
-                        .usr_command_value()
-                        .bits(cmd.value())
-                });
-            }
-
-            #[cfg(not(esp32))]
-            if !address.is_none() {
-                reg_block.user1().modify(|_, w| unsafe {
-                    w.usr_addr_bitlen().bits((address.width() - 1) as u8)
-                });
-
-                let addr = address.value() << (32 - address.width());
-                reg_block
-                    .addr()
-                    .write(|w| unsafe { w.usr_addr_value().bits(addr) });
-            }
-
-            #[cfg(esp32)]
-            if !address.is_none() {
-                reg_block.user1().modify(|r, w| unsafe {
-                    w.bits(r.bits() & !(0x3f << 26) | (((address.width() - 1) as u32) & 0x3f) << 26)
-                });
-
-                let addr = address.value() << (32 - address.width());
-                reg_block.addr().write(|w| unsafe { w.bits(addr) });
-            }
-
-            if dummy > 0 {
-                reg_block
-                    .user1()
-                    .modify(|_, w| unsafe { w.usr_dummy_cyclelen().bits(dummy - 1) });
-            }
 
             let result = unsafe {
                 self.spi
@@ -1393,55 +1385,15 @@ mod dma {
                 return Err((Error::MaxDmaTransferSizeExceeded, self, buffer));
             }
 
-            self.spi.init_half_duplex(
+            self.spi.setup_half_duplex(
                 true,
-                !cmd.is_none(),
-                !address.is_none(),
+                cmd,
+                address,
                 false,
-                dummy != 0,
+                dummy,
                 bytes_to_write == 0,
+                data_mode,
             );
-            self.spi
-                .init_spi_data_mode(cmd.mode(), address.mode(), data_mode);
-
-            // set cmd, address, dummy cycles
-            let reg_block = self.spi.register_block();
-            if !cmd.is_none() {
-                reg_block.user2().modify(|_, w| unsafe {
-                    w.usr_command_bitlen()
-                        .bits((cmd.width() - 1) as u8)
-                        .usr_command_value()
-                        .bits(cmd.value())
-                });
-            }
-
-            #[cfg(not(esp32))]
-            if !address.is_none() {
-                reg_block.user1().modify(|_, w| unsafe {
-                    w.usr_addr_bitlen().bits((address.width() - 1) as u8)
-                });
-
-                let addr = address.value() << (32 - address.width());
-                reg_block
-                    .addr()
-                    .write(|w| unsafe { w.usr_addr_value().bits(addr) });
-            }
-
-            #[cfg(esp32)]
-            if !address.is_none() {
-                reg_block.user1().modify(|r, w| unsafe {
-                    w.bits(r.bits() & !(0x3f << 26) | (((address.width() - 1) as u32) & 0x3f) << 26)
-                });
-
-                let addr = address.value() << (32 - address.width());
-                reg_block.addr().write(|w| unsafe { w.bits(addr) });
-            }
-
-            if dummy > 0 {
-                reg_block
-                    .user1()
-                    .modify(|_, w| unsafe { w.usr_dummy_cyclelen().bits(dummy - 1) });
-            }
 
             let result = unsafe {
                 self.spi
@@ -2121,11 +2073,11 @@ mod ehal1 {
         T: Instance,
     {
         fn read(&mut self) -> nb::Result<u8, Self::Error> {
-            self.spi.read_byte()
+            self.read_byte()
         }
 
         fn write(&mut self, word: u8) -> nb::Result<(), Self::Error> {
-            self.spi.write_byte(word)
+            self.write_byte(word)
         }
     }
 
@@ -2133,8 +2085,15 @@ mod ehal1 {
     where
         T: Instance,
     {
+        #[cfg_attr(place_spi_driver_in_ram, ram)]
         fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
-            self.spi.read_bytes(words)
+            let empty_array = [EMPTY_WRITE_PAD; FIFO_SIZE];
+            for chunk in words.chunks_mut(FIFO_SIZE) {
+                self.spi.write_bytes(&empty_array[0..chunk.len()])?;
+                self.spi.flush()?;
+                self.spi.read_bytes_from_fifo(chunk)?;
+            }
+            Ok(())
         }
 
         fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
@@ -2326,14 +2285,7 @@ pub trait InstanceDma: Instance {
         Ok(())
     }
 
-    fn dma_peripheral(&self) -> DmaPeripheral {
-        match self.spi_num() {
-            2 => DmaPeripheral::Spi2,
-            #[cfg(spi3)]
-            3 => DmaPeripheral::Spi3,
-            _ => panic!("Illegal SPI instance"),
-        }
-    }
+    fn dma_peripheral(&self) -> DmaPeripheral;
 
     fn enable_dma(&self) {
         #[cfg(gdma)]
@@ -2383,9 +2335,10 @@ pub trait InstanceDma: Instance {
         self.clear_dma_interrupts();
     }
 
-    #[cfg(gdma)]
     fn clear_dma_interrupts(&self) {
         let reg_block = self.register_block();
+
+        #[cfg(gdma)]
         reg_block.dma_int_clr().write(|w| {
             w.dma_infifo_full_err().clear_bit_by_one();
             w.dma_outfifo_empty_err().clear_bit_by_one();
@@ -2393,11 +2346,8 @@ pub trait InstanceDma: Instance {
             w.mst_rx_afifo_wfull_err().clear_bit_by_one();
             w.mst_tx_afifo_rempty_err().clear_bit_by_one()
         });
-    }
 
-    #[cfg(pdma)]
-    fn clear_dma_interrupts(&self) {
-        let reg_block = self.register_block();
+        #[cfg(pdma)]
         reg_block.dma_int_clr().write(|w| {
             w.inlink_dscr_empty().clear_bit_by_one();
             w.outlink_dscr_error().clear_bit_by_one();
@@ -2412,10 +2362,18 @@ pub trait InstanceDma: Instance {
     }
 }
 
-impl InstanceDma for crate::peripherals::SPI2 {}
+impl InstanceDma for crate::peripherals::SPI2 {
+    fn dma_peripheral(&self) -> DmaPeripheral {
+        DmaPeripheral::Spi2
+    }
+}
 
 #[cfg(spi3)]
-impl InstanceDma for crate::peripherals::SPI3 {}
+impl InstanceDma for crate::peripherals::SPI3 {
+    fn dma_peripheral(&self) -> DmaPeripheral {
+        DmaPeripheral::Spi3
+    }
+}
 
 #[doc(hidden)]
 pub trait ExtendedInstance: Instance {
@@ -2875,10 +2833,10 @@ pub trait Instance: private::Sealed {
         }
     }
 
-    #[cfg(not(esp32))]
     fn set_data_mode(&mut self, data_mode: SpiMode) -> &mut Self {
         let reg_block = self.register_block();
 
+        #[cfg(not(esp32))]
         match data_mode {
             SpiMode::Mode0 => {
                 reg_block.misc().modify(|_, w| w.ck_idle_edge().clear_bit());
@@ -2897,13 +2855,8 @@ pub trait Instance: private::Sealed {
                 reg_block.user().modify(|_, w| w.ck_out_edge().clear_bit());
             }
         }
-        self
-    }
 
-    #[cfg(esp32)]
-    fn set_data_mode(&mut self, data_mode: SpiMode) -> &mut Self {
-        let reg_block = self.register_block();
-
+        #[cfg(esp32)]
         match data_mode {
             SpiMode::Mode0 => {
                 reg_block.pin().modify(|_, w| w.ck_idle_edge().clear_bit());
@@ -2922,6 +2875,7 @@ pub trait Instance: private::Sealed {
                 reg_block.user().modify(|_, w| w.ck_out_edge().clear_bit());
             }
         }
+
         self
     }
 
@@ -2952,37 +2906,36 @@ pub trait Instance: private::Sealed {
         });
     }
 
-    #[cfg(not(any(esp32, esp32c3, esp32s2)))]
     fn set_bit_order(&mut self, read_order: SpiBitOrder, write_order: SpiBitOrder) {
         let reg_block = self.register_block();
 
-        let read_value = match read_order {
-            SpiBitOrder::MSBFirst => 0,
-            SpiBitOrder::LSBFirst => 1,
-        };
-        let write_value = match write_order {
-            SpiBitOrder::MSBFirst => 0,
-            SpiBitOrder::LSBFirst => 1,
-        };
+        #[cfg(not(any(esp32, esp32c3, esp32s2)))]
         reg_block.ctrl().modify(|_, w| unsafe {
+            let read_value = match read_order {
+                SpiBitOrder::MSBFirst => 0,
+                SpiBitOrder::LSBFirst => 1,
+            };
+            let write_value = match write_order {
+                SpiBitOrder::MSBFirst => 0,
+                SpiBitOrder::LSBFirst => 1,
+            };
+
             w.rd_bit_order().bits(read_value);
             w.wr_bit_order().bits(write_value);
             w
         });
-    }
-    #[cfg(any(esp32, esp32c3, esp32s2))]
-    fn set_bit_order(&mut self, read_order: SpiBitOrder, write_order: SpiBitOrder) {
-        let reg_block = self.register_block();
 
-        let read_value = match read_order {
-            SpiBitOrder::MSBFirst => false,
-            SpiBitOrder::LSBFirst => true,
-        };
-        let write_value = match write_order {
-            SpiBitOrder::MSBFirst => false,
-            SpiBitOrder::LSBFirst => true,
-        };
+        #[cfg(any(esp32, esp32c3, esp32s2))]
         reg_block.ctrl().modify(|_, w| {
+            let read_value = match read_order {
+                SpiBitOrder::MSBFirst => false,
+                SpiBitOrder::LSBFirst => true,
+            };
+            let write_value = match write_order {
+                SpiBitOrder::MSBFirst => false,
+                SpiBitOrder::LSBFirst => true,
+            };
+
             w.rd_bit_order().bit(read_value);
             w.wr_bit_order().bit(write_value);
             w
@@ -3073,23 +3026,6 @@ pub trait Instance: private::Sealed {
         Ok(())
     }
 
-    /// Read bytes from SPI.
-    ///
-    /// Sends out a stuffing byte for every byte to read. This function doesn't
-    /// perform flushing. If you want to read the response to something you
-    /// have written before, consider using [`Self::transfer`] instead.
-    #[cfg_attr(place_spi_driver_in_ram, ram)]
-    fn read_bytes(&mut self, words: &mut [u8]) -> Result<(), Error> {
-        let empty_array = [EMPTY_WRITE_PAD; FIFO_SIZE];
-
-        for chunk in words.chunks_mut(FIFO_SIZE) {
-            self.write_bytes(&empty_array[0..chunk.len()])?;
-            self.flush()?;
-            self.read_bytes_from_fifo(chunk)?;
-        }
-        Ok(())
-    }
-
     /// Read received bytes from SPI FIFO.
     ///
     /// Copies the contents of the SPI receive FIFO into `words`. This function
@@ -3128,37 +3064,30 @@ pub trait Instance: private::Sealed {
         Ok(())
     }
 
-    #[cfg_attr(place_spi_driver_in_ram, ram)]
-    fn transfer<'w>(&mut self, words: &'w mut [u8]) -> Result<&'w [u8], Error> {
-        for chunk in words.chunks_mut(FIFO_SIZE) {
-            self.write_bytes(chunk)?;
-            self.flush()?;
-            self.read_bytes_from_fifo(chunk)?;
-        }
-
-        Ok(words)
-    }
-
     fn start_operation(&self) {
         let reg_block = self.register_block();
         self.update();
         reg_block.cmd().modify(|_, w| w.usr().set_bit());
     }
 
-    fn init_half_duplex(
+    fn setup_half_duplex(
         &mut self,
         is_write: bool,
-        command_state: bool,
-        address_state: bool,
+        cmd: Command,
+        address: Address,
         dummy_idle: bool,
-        dummy_state: bool,
+        dummy: u8,
         no_mosi_miso: bool,
+        data_mode: SpiDataMode,
     ) {
+        let command_state = !cmd.is_none();
+        let address_state = !address.is_none();
+        let dummy_state = dummy != 0;
         let reg_block = self.register_block();
         reg_block.user().modify(|_, w| {
             w.usr_miso_highpart()
                 .clear_bit()
-                .usr_miso_highpart()
+                .usr_mosi_highpart()
                 .clear_bit()
                 .doutdin()
                 .clear_bit()
@@ -3203,23 +3132,8 @@ pub trait Instance: private::Sealed {
         reg_block.slave().write(|w| unsafe { w.bits(0) });
 
         self.update();
-    }
 
-    fn write_bytes_half_duplex(
-        &mut self,
-        cmd: Command,
-        address: Address,
-        dummy: u8,
-        buffer: &[u8],
-    ) -> Result<(), Error> {
-        self.init_half_duplex(
-            true,
-            !cmd.is_none(),
-            !address.is_none(),
-            false,
-            dummy != 0,
-            buffer.is_empty(),
-        );
+        self.init_spi_data_mode(cmd.mode(), address.mode(), data_mode);
 
         // set cmd, address, dummy cycles
         let reg_block = self.register_block();
@@ -3259,76 +3173,6 @@ pub trait Instance: private::Sealed {
                 .user1()
                 .modify(|_, w| unsafe { w.usr_dummy_cyclelen().bits(dummy - 1) });
         }
-
-        if !buffer.is_empty() {
-            // re-using the full-duplex write here
-            self.write_bytes(buffer)?;
-        } else {
-            self.start_operation();
-        }
-
-        self.flush()
-    }
-
-    fn read_bytes_half_duplex(
-        &mut self,
-        cmd: Command,
-        address: Address,
-        dummy: u8,
-        buffer: &mut [u8],
-    ) -> Result<(), Error> {
-        self.init_half_duplex(
-            false,
-            !cmd.is_none(),
-            !address.is_none(),
-            false,
-            dummy != 0,
-            buffer.is_empty(),
-        );
-
-        // set cmd, address, dummy cycles
-        let reg_block = self.register_block();
-        if !cmd.is_none() {
-            reg_block.user2().modify(|_, w| unsafe {
-                w.usr_command_bitlen()
-                    .bits((cmd.width() - 1) as u8)
-                    .usr_command_value()
-                    .bits(cmd.value())
-            });
-        }
-
-        #[cfg(not(esp32))]
-        if !address.is_none() {
-            reg_block
-                .user1()
-                .modify(|_, w| unsafe { w.usr_addr_bitlen().bits((address.width() - 1) as u8) });
-
-            let addr = address.value() << (32 - address.width());
-            reg_block
-                .addr()
-                .write(|w| unsafe { w.usr_addr_value().bits(addr) });
-        }
-
-        #[cfg(esp32)]
-        if !address.is_none() {
-            reg_block.user1().modify(|r, w| unsafe {
-                w.bits(r.bits() & !(0x3f << 26) | (((address.width() - 1) as u32) & 0x3f) << 26)
-            });
-
-            let addr = address.value() << (32 - address.width());
-            reg_block.addr().write(|w| unsafe { w.bits(addr) });
-        }
-
-        if dummy > 0 {
-            reg_block
-                .user1()
-                .modify(|_, w| unsafe { w.usr_dummy_cyclelen().bits(dummy - 1) });
-        }
-
-        self.configure_datalen(buffer.len(), 0);
-        self.start_operation();
-        self.flush()?;
-        self.read_bytes_from_fifo(buffer)
     }
 
     fn update(&self) {
