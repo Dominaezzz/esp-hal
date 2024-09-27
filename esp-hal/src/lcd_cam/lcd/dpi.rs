@@ -1,0 +1,574 @@
+//! # LCD - RGB/Digital Parallel Interface Mode
+//!
+//! ## Overview
+//!
+//! ## Example
+//!
+//! ### A display.
+
+use core::{
+    mem::ManuallyDrop,
+    ops::{Deref, DerefMut},
+};
+
+use fugit::HertzU32;
+
+use crate::{
+    clock::Clocks,
+    dma::{AnyDmaChannel, ChannelTx, DmaChannel, DmaError, DmaPeripheral, DmaTxBuffer, Tx},
+    gpio::{Level, OutputSignal, PeripheralOutput},
+    lcd_cam::{
+        lcd::{ClockMode, DelayMode, Lcd, Phase, Polarity},
+        private::calculate_clkm,
+        BitOrder,
+        ByteOrder,
+    },
+    peripheral::{Peripheral, PeripheralRef},
+    peripherals::LCD_CAM,
+    Mode,
+};
+
+/// Represents the RGB LCD interface.
+pub struct Dpi<'d, CH: DmaChannel = AnyDmaChannel> {
+    lcd_cam: PeripheralRef<'d, LCD_CAM>,
+    tx_channel: ChannelTx<'d, CH>,
+}
+
+impl<'d, CH: DmaChannel> Dpi<'d, CH> {
+    /// Create a new instance of the RGB/DPI driver.
+    pub fn new<DM: Mode>(
+        lcd: Lcd<'d, DM>,
+        channel: ChannelTx<'d, CH>,
+        frequency: HertzU32,
+        config: Config,
+    ) -> Self {
+        let lcd_cam = lcd.lcd_cam;
+
+        let clocks = Clocks::get();
+        // Due to https://www.espressif.com/sites/default/files/documentation/esp32-s3_errata_en.pdf
+        // the LCD_PCLK divider must be at least 2. To make up for this the user
+        // provided frequency is doubled to match.
+        let (i, divider) = calculate_clkm(
+            (frequency.to_Hz() * 2) as _,
+            &[
+                clocks.xtal_clock.to_Hz() as _,
+                clocks.cpu_clock.to_Hz() as _,
+                clocks.crypto_pwm_clock.to_Hz() as _,
+            ],
+        );
+
+        lcd_cam.lcd_clock().write(|w| unsafe {
+            // Force enable the clock for all configuration registers.
+            w.clk_en().set_bit();
+            w.lcd_clk_sel().bits((i + 1) as _);
+            w.lcd_clkm_div_num().bits(divider.div_num as _);
+            w.lcd_clkm_div_b().bits(divider.div_b as _);
+            w.lcd_clkm_div_a().bits(divider.div_a as _); // LCD_PCLK = LCD_CLK / 2
+            w.lcd_clk_equ_sysclk().clear_bit();
+            w.lcd_clkcnt_n().bits(2 - 1); // Must not be 0.
+            w.lcd_ck_idle_edge()
+                .bit(config.clock_mode.polarity == Polarity::IdleHigh);
+            w.lcd_ck_out_edge()
+                .bit(config.clock_mode.phase == Phase::ShiftHigh)
+        });
+        lcd_cam.lcd_user().modify(|_, w| w.lcd_reset().set_bit());
+
+        lcd_cam
+            .lcd_rgb_yuv()
+            .write(|w| w.lcd_conv_bypass().clear_bit());
+
+        lcd_cam.lcd_user().modify(|_, w| {
+            w.lcd_8bits_order()
+                .bit(config.format.invert_every_two_bytes);
+            w.lcd_bit_order()
+                .bit(config.format.bit_order == BitOrder::Inverted);
+            w.lcd_byte_order()
+                .bit(config.format.byte_order == ByteOrder::Inverted);
+            w.lcd_2byte_en().bit(config.format.enable_2byte_mode);
+
+            // Only valid in Intel8080 mode.
+            w.lcd_cmd().clear_bit();
+            w.lcd_dummy().clear_bit();
+
+            // This needs to be explicitly set for RGB mode.
+            w.lcd_dout().set_bit()
+        });
+
+        let timing = &config.timing;
+        lcd_cam.lcd_ctrl().modify(|_, w| unsafe {
+            // Enable RGB mode, and input VSYNC, HSYNC, and DE signals.
+            w.lcd_rgb_mode_en().set_bit();
+
+            w.lcd_hb_front()
+                .bits((timing.horizontal_blank_front_porch as u16).saturating_sub(1));
+            w.lcd_va_height()
+                .bits((timing.vertical_active_height as u16).saturating_sub(1));
+            w.lcd_vt_height()
+                .bits((timing.vertical_total_height as u16).saturating_sub(1))
+        });
+        lcd_cam.lcd_ctrl1().modify(|_, w| unsafe {
+            w.lcd_vb_front()
+                .bits((timing.vertical_blank_front_porch as u8).saturating_sub(1));
+            w.lcd_ha_width()
+                .bits((timing.horizontal_active_width as u16).saturating_sub(1));
+            w.lcd_ht_width()
+                .bits((timing.horizontal_total_width as u16).saturating_sub(1))
+        });
+        lcd_cam.lcd_ctrl2().modify(|_, w| unsafe {
+            w.lcd_vsync_width()
+                .bits((timing.vsync_width as u8).saturating_sub(1));
+            w.lcd_vsync_idle_pol()
+                .bit(config.vsync_idle_polarity.into());
+            w.lcd_de_idle_pol().bit(config.de_idle_polarity.into());
+            w.lcd_hs_blank_en().bit(timing.hs_blank_en);
+            w.lcd_hsync_width()
+                .bits((timing.hsync_width as u8).saturating_sub(1));
+            w.lcd_hsync_idle_pol()
+                .bit(config.hsync_idle_polarity.into());
+            w.lcd_hsync_position()
+                .bits(timing.hsync_position as u8 /* TODO: verify - 1 */)
+        });
+
+        lcd_cam.lcd_misc().modify(|_, w| unsafe {
+            // TODO: Find out what this field actually does.
+            // Set the threshold for Async Tx FIFO full event. (5 bits)
+            w.lcd_afifo_threshold_num().bits((1 << 5) - 1);
+
+            // Doesn't matter for RGB mode.
+            w.lcd_vfk_cyclelen().bits(0);
+            w.lcd_vbk_cyclelen().bits(0);
+
+            // 1: Send the next frame data when the current frame is sent out.
+            // 0: LCD stops when the current frame is sent out.
+            w.lcd_next_frame_en().clear_bit();
+
+            // Enable blank region when LCD sends data out.
+            w.lcd_bk_en().bit(!config.disable_black_region)
+        });
+        lcd_cam.lcd_dly_mode().modify(|_, w| unsafe {
+            w.lcd_de_mode().bits(config.de_mode as u8);
+            w.lcd_hsync_mode().bits(config.hsync_mode as u8);
+            w.lcd_vsync_mode().bits(config.vsync_mode as u8);
+            w
+        });
+        lcd_cam.lcd_data_dout_mode().modify(|_, w| unsafe {
+            w.dout0_mode().bits(config.output_bit_mode as u8);
+            w.dout1_mode().bits(config.output_bit_mode as u8);
+            w.dout2_mode().bits(config.output_bit_mode as u8);
+            w.dout3_mode().bits(config.output_bit_mode as u8);
+            w.dout4_mode().bits(config.output_bit_mode as u8);
+            w.dout5_mode().bits(config.output_bit_mode as u8);
+            w.dout6_mode().bits(config.output_bit_mode as u8);
+            w.dout7_mode().bits(config.output_bit_mode as u8);
+            w.dout8_mode().bits(config.output_bit_mode as u8);
+            w.dout9_mode().bits(config.output_bit_mode as u8);
+            w.dout10_mode().bits(config.output_bit_mode as u8);
+            w.dout11_mode().bits(config.output_bit_mode as u8);
+            w.dout12_mode().bits(config.output_bit_mode as u8);
+            w.dout13_mode().bits(config.output_bit_mode as u8);
+            w.dout14_mode().bits(config.output_bit_mode as u8);
+            w.dout15_mode().bits(config.output_bit_mode as u8)
+        });
+
+        lcd_cam.lcd_user().modify(|_, w| w.lcd_update().set_bit());
+
+        Self {
+            lcd_cam,
+            tx_channel: channel,
+        }
+    }
+
+    /// Configures the control pins for the RGB/DPI interface.
+    pub fn with_ctrl_pins<
+        VSYNC: PeripheralOutput,
+        HSYNC: PeripheralOutput,
+        DE: PeripheralOutput,
+        PCLK: PeripheralOutput,
+    >(
+        self,
+        vsync: impl Peripheral<P = VSYNC> + 'd,
+        hsync: impl Peripheral<P = HSYNC> + 'd,
+        de: impl Peripheral<P = DE> + 'd,
+        pclk: impl Peripheral<P = PCLK> + 'd,
+    ) -> Self {
+        crate::into_ref!(vsync);
+        crate::into_ref!(hsync);
+        crate::into_ref!(de);
+        crate::into_ref!(pclk);
+
+        vsync.set_to_push_pull_output(crate::private::Internal);
+        hsync.set_to_push_pull_output(crate::private::Internal);
+        de.set_to_push_pull_output(crate::private::Internal);
+        pclk.set_to_push_pull_output(crate::private::Internal);
+
+        vsync.connect_peripheral_to_output(OutputSignal::LCD_V_SYNC, crate::private::Internal);
+        hsync.connect_peripheral_to_output(OutputSignal::LCD_H_SYNC, crate::private::Internal);
+        de.connect_peripheral_to_output(OutputSignal::LCD_H_ENABLE, crate::private::Internal);
+        pclk.connect_peripheral_to_output(OutputSignal::LCD_PCLK, crate::private::Internal);
+
+        self
+    }
+
+    /// Configures the data pins for the RGB/DPI interface.
+    pub fn with_data_pins<
+        D0: PeripheralOutput,
+        D1: PeripheralOutput,
+        D2: PeripheralOutput,
+        D3: PeripheralOutput,
+        D4: PeripheralOutput,
+        D5: PeripheralOutput,
+        D6: PeripheralOutput,
+        D7: PeripheralOutput,
+        D8: PeripheralOutput,
+        D9: PeripheralOutput,
+        D10: PeripheralOutput,
+        D11: PeripheralOutput,
+        D12: PeripheralOutput,
+        D13: PeripheralOutput,
+        D14: PeripheralOutput,
+        D15: PeripheralOutput,
+    >(
+        self,
+        d0: impl Peripheral<P = D0> + 'd,
+        d1: impl Peripheral<P = D1> + 'd,
+        d2: impl Peripheral<P = D2> + 'd,
+        d3: impl Peripheral<P = D3> + 'd,
+        d4: impl Peripheral<P = D4> + 'd,
+        d5: impl Peripheral<P = D5> + 'd,
+        d6: impl Peripheral<P = D6> + 'd,
+        d7: impl Peripheral<P = D7> + 'd,
+        d8: impl Peripheral<P = D8> + 'd,
+        d9: impl Peripheral<P = D9> + 'd,
+        d10: impl Peripheral<P = D10> + 'd,
+        d11: impl Peripheral<P = D11> + 'd,
+        d12: impl Peripheral<P = D12> + 'd,
+        d13: impl Peripheral<P = D13> + 'd,
+        d14: impl Peripheral<P = D14> + 'd,
+        d15: impl Peripheral<P = D15> + 'd,
+    ) -> Self {
+        crate::into_ref!(d0);
+        crate::into_ref!(d1);
+        crate::into_ref!(d2);
+        crate::into_ref!(d3);
+        crate::into_ref!(d4);
+        crate::into_ref!(d5);
+        crate::into_ref!(d6);
+        crate::into_ref!(d7);
+        crate::into_ref!(d8);
+        crate::into_ref!(d9);
+        crate::into_ref!(d10);
+        crate::into_ref!(d11);
+        crate::into_ref!(d12);
+        crate::into_ref!(d13);
+        crate::into_ref!(d14);
+        crate::into_ref!(d15);
+
+        d0.set_to_push_pull_output(crate::private::Internal);
+        d1.set_to_push_pull_output(crate::private::Internal);
+        d2.set_to_push_pull_output(crate::private::Internal);
+        d3.set_to_push_pull_output(crate::private::Internal);
+        d4.set_to_push_pull_output(crate::private::Internal);
+        d5.set_to_push_pull_output(crate::private::Internal);
+        d6.set_to_push_pull_output(crate::private::Internal);
+        d7.set_to_push_pull_output(crate::private::Internal);
+        d8.set_to_push_pull_output(crate::private::Internal);
+        d9.set_to_push_pull_output(crate::private::Internal);
+        d10.set_to_push_pull_output(crate::private::Internal);
+        d11.set_to_push_pull_output(crate::private::Internal);
+        d12.set_to_push_pull_output(crate::private::Internal);
+        d13.set_to_push_pull_output(crate::private::Internal);
+        d14.set_to_push_pull_output(crate::private::Internal);
+        d15.set_to_push_pull_output(crate::private::Internal);
+
+        d0.connect_peripheral_to_output(OutputSignal::LCD_DATA_0, crate::private::Internal);
+        d1.connect_peripheral_to_output(OutputSignal::LCD_DATA_1, crate::private::Internal);
+        d2.connect_peripheral_to_output(OutputSignal::LCD_DATA_2, crate::private::Internal);
+        d3.connect_peripheral_to_output(OutputSignal::LCD_DATA_3, crate::private::Internal);
+        d4.connect_peripheral_to_output(OutputSignal::LCD_DATA_4, crate::private::Internal);
+        d5.connect_peripheral_to_output(OutputSignal::LCD_DATA_5, crate::private::Internal);
+        d6.connect_peripheral_to_output(OutputSignal::LCD_DATA_6, crate::private::Internal);
+        d7.connect_peripheral_to_output(OutputSignal::LCD_DATA_7, crate::private::Internal);
+        d8.connect_peripheral_to_output(OutputSignal::LCD_DATA_8, crate::private::Internal);
+        d9.connect_peripheral_to_output(OutputSignal::LCD_DATA_9, crate::private::Internal);
+        d10.connect_peripheral_to_output(OutputSignal::LCD_DATA_10, crate::private::Internal);
+        d11.connect_peripheral_to_output(OutputSignal::LCD_DATA_11, crate::private::Internal);
+        d12.connect_peripheral_to_output(OutputSignal::LCD_DATA_12, crate::private::Internal);
+        d13.connect_peripheral_to_output(OutputSignal::LCD_DATA_13, crate::private::Internal);
+        d14.connect_peripheral_to_output(OutputSignal::LCD_DATA_14, crate::private::Internal);
+        d15.connect_peripheral_to_output(OutputSignal::LCD_DATA_15, crate::private::Internal);
+
+        self
+    }
+
+    /// Same as [Self::with_data_pins] but specifies which pin likely
+    /// corresponds to which color.
+    pub fn with_color_pins<
+        D0: PeripheralOutput,
+        D1: PeripheralOutput,
+        D2: PeripheralOutput,
+        D3: PeripheralOutput,
+        D4: PeripheralOutput,
+        D5: PeripheralOutput,
+        D6: PeripheralOutput,
+        D7: PeripheralOutput,
+        D8: PeripheralOutput,
+        D9: PeripheralOutput,
+        D10: PeripheralOutput,
+        D11: PeripheralOutput,
+        D12: PeripheralOutput,
+        D13: PeripheralOutput,
+        D14: PeripheralOutput,
+        D15: PeripheralOutput,
+    >(
+        self,
+        b0: impl Peripheral<P = D0> + 'd,
+        b1: impl Peripheral<P = D1> + 'd,
+        b2: impl Peripheral<P = D2> + 'd,
+        b3: impl Peripheral<P = D3> + 'd,
+        b4: impl Peripheral<P = D4> + 'd,
+        g0: impl Peripheral<P = D5> + 'd,
+        g1: impl Peripheral<P = D6> + 'd,
+        g2: impl Peripheral<P = D7> + 'd,
+        g3: impl Peripheral<P = D8> + 'd,
+        g4: impl Peripheral<P = D9> + 'd,
+        g5: impl Peripheral<P = D10> + 'd,
+        r0: impl Peripheral<P = D11> + 'd,
+        r1: impl Peripheral<P = D12> + 'd,
+        r2: impl Peripheral<P = D13> + 'd,
+        r3: impl Peripheral<P = D14> + 'd,
+        r4: impl Peripheral<P = D15> + 'd,
+    ) -> Self {
+        self.with_data_pins(
+            b0, b1, b2, b3, b4, g0, g1, g2, g3, g4, g5, r0, r1, r2, r3, r4,
+        )
+    }
+
+    /// Sending out the [DmaTxBuffer] to the RGB/DPI interface.
+    ///
+    /// - `next_frame_en`: Automatically send the next frame data when the
+    ///   current frame is sent out.
+    pub fn send<TX: DmaTxBuffer>(
+        mut self,
+        next_frame_en: bool,
+        mut buf: TX,
+    ) -> Result<DpiTransfer<'d, TX, CH>, (DmaError, Self, TX)> {
+        let result = unsafe {
+            self.tx_channel
+                .prepare_transfer(DmaPeripheral::LcdCam, &mut buf)
+        }
+        .and_then(|_| self.tx_channel.start_transfer());
+        if let Err(err) = result {
+            return Err((err, self, buf));
+        }
+
+        // Reset LCD control unit and Async Tx FIFO
+        self.lcd_cam
+            .lcd_user()
+            .modify(|_, w| w.lcd_reset().set_bit());
+        self.lcd_cam
+            .lcd_misc()
+            .modify(|_, w| w.lcd_afifo_reset().set_bit());
+
+        self.lcd_cam.lcd_misc().modify(|_, w| {
+            // 1: Send the next frame data when the current frame is sent out.
+            // 0: LCD stops when the current frame is sent out.
+            w.lcd_next_frame_en().bit(next_frame_en)
+        });
+
+        // Start the transfer.
+        self.lcd_cam.lcd_user().modify(|_, w| {
+            w.lcd_update().set_bit();
+            w.lcd_start().set_bit()
+        });
+
+        Ok(DpiTransfer {
+            dpi: ManuallyDrop::new(self),
+            buffer_view: ManuallyDrop::new(buf.into_view()),
+        })
+    }
+}
+
+/// TODO
+pub struct DpiTransfer<'d, BUF: DmaTxBuffer, CH: DmaChannel = AnyDmaChannel> {
+    dpi: ManuallyDrop<Dpi<'d, CH>>,
+    buffer_view: ManuallyDrop<BUF::View>,
+}
+
+impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> DpiTransfer<'d, BUF, CH> {
+    /// Returns true when [Self::wait] will not block.
+    pub fn is_done(&self) -> bool {
+        self.dpi
+            .lcd_cam
+            .lcd_user()
+            .read()
+            .lcd_start()
+            .bit_is_clear()
+    }
+
+    /// Stops this transfer on the spot and returns the peripheral and buffer.
+    pub fn stop(mut self) -> (Dpi<'d, CH>, BUF) {
+        self.stop_peripherals();
+        let (dpi, view) = self.release();
+        (dpi, BUF::from_view(view))
+    }
+
+    /// Waits for the transfer to finish and returns the peripheral and buffer.
+    ///
+    /// Note: If you specified `next_frame_en` as true in [Dpi::send], you're
+    /// just waiting for a DMA error when you call this.
+    pub fn wait(self) -> (Result<(), DmaError>, Dpi<'d, CH>, BUF) {
+        while !self.is_done() {
+            core::hint::spin_loop();
+        }
+
+        // Note: There is no "done" interrupt to clear.
+
+        let (dpi, view) = self.release();
+        let result = if dpi.tx_channel.has_error() {
+            Err(DmaError::DescriptorError)
+        } else {
+            Ok(())
+        };
+
+        (result, dpi, BUF::from_view(view))
+    }
+
+    fn release(mut self) -> (Dpi<'d, CH>, BUF::View) {
+        // SAFETY: Since forget is called on self, we know that self.camera and
+        // self.buffer_view won't be touched again.
+        let result = unsafe {
+            let dpi = ManuallyDrop::take(&mut self.dpi);
+            let view = ManuallyDrop::take(&mut self.buffer_view);
+            (dpi, view)
+        };
+        core::mem::forget(self);
+        result
+    }
+
+    fn stop_peripherals(&mut self) {
+        // Stop the LCD_CAM peripheral.
+        self.dpi
+            .lcd_cam
+            .lcd_user()
+            .modify(|_, w| w.lcd_start().clear_bit());
+
+        // Stop the DMA
+        self.dpi.tx_channel.stop_transfer();
+    }
+}
+
+impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> Deref for DpiTransfer<'d, BUF, CH> {
+    type Target = BUF::View;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffer_view
+    }
+}
+
+impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> DerefMut for DpiTransfer<'d, BUF, CH> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffer_view
+    }
+}
+
+impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> Drop for DpiTransfer<'d, BUF, CH> {
+    fn drop(&mut self) {
+        self.stop_peripherals();
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+/// Configuration settings for the RGB/DPI interface.
+pub struct Config {
+    /// Specifies the clock mode, including polarity and phase settings.
+    pub clock_mode: ClockMode,
+
+    /// TODO
+    pub format: Format,
+    /// TODO
+    pub timing: FrameTiming,
+
+    /// TODO
+    pub vsync_idle_polarity: Level,
+    /// TODO
+    pub hsync_idle_polarity: Level,
+    /// TODO
+    pub de_idle_polarity: Level,
+
+    /// Disables blank region when LCD sends data out.
+    pub disable_black_region: bool,
+
+    /// The output LCD_DE is delayed by module clock LCD_CLK.
+    pub de_mode: DelayMode,
+    /// The output LCD_HSYNC is delayed by module clock LCD_CLK.
+    pub hsync_mode: DelayMode,
+    /// The output LCD_VSYNC is delayed by module clock LCD_CLK.
+    pub vsync_mode: DelayMode,
+    /// The output data bits are delayed by module clock LCD_CLK.
+    pub output_bit_mode: DelayMode,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            clock_mode: Default::default(),
+            format: Default::default(),
+            timing: Default::default(),
+            vsync_idle_polarity: Level::Low,
+            hsync_idle_polarity: Level::Low,
+            de_idle_polarity: Level::Low,
+            disable_black_region: false,
+            de_mode: Default::default(),
+            hsync_mode: Default::default(),
+            vsync_mode: Default::default(),
+            output_bit_mode: Default::default(),
+        }
+    }
+}
+
+/// TODO
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Format {
+    /// TODO
+    pub bit_order: BitOrder,
+    /// TODO
+    pub byte_order: ByteOrder,
+    /// TODO
+    pub enable_2byte_mode: bool,
+    /// TODO
+    pub invert_every_two_bytes: bool,
+}
+
+/// TODO
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct FrameTiming {
+    /// 11 bits
+    pub horizontal_blank_front_porch: usize,
+    /// 10 bits
+    pub vertical_active_height: usize,
+    /// 10 bits
+    pub vertical_total_height: usize,
+
+    /// 8 bits
+    pub vertical_blank_front_porch: usize,
+    /// 12 bits
+    pub horizontal_active_width: usize,
+    /// 12 bits
+    pub horizontal_total_width: usize,
+
+    /// It is the width of LCD_VSYNC active pulse in a line. (7 bits)
+    pub vsync_width: usize,
+
+    /// The width of LCD_HSYNC active pulse in a line. (7 bits)
+    pub hsync_width: usize,
+
+    /// 1: The pulse of LCD_HSYNC is out in vertical blanking lines.
+    /// 0: LCD_HSYNC pulse is valid only in active region lines
+    pub hs_blank_en: bool,
+
+    /// It is the position of LCD_HSYNC active pulse in a line. (7 bits)
+    pub hsync_position: usize,
+}
