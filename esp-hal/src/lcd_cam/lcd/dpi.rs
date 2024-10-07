@@ -79,7 +79,7 @@ impl<'d, CH: DmaChannel> Dpi<'d, CH> {
 
         lcd_cam.lcd_user().modify(|_, w| {
             w.lcd_8bits_order()
-                .bit(config.format.invert_every_two_bytes);
+                .bit(config.format.byte_order == ByteOrder::Inverted);
             w.lcd_bit_order()
                 .bit(config.format.bit_order == BitOrder::Inverted);
             w.lcd_byte_order()
@@ -118,15 +118,15 @@ impl<'d, CH: DmaChannel> Dpi<'d, CH> {
             w.lcd_vsync_width()
                 .bits((timing.vsync_width as u8).saturating_sub(1));
             w.lcd_vsync_idle_pol()
-                .bit(config.vsync_idle_polarity.into());
-            w.lcd_de_idle_pol().bit(config.de_idle_polarity.into());
-            w.lcd_hs_blank_en().bit(timing.hs_blank_en);
+                .bit(config.vsync_idle_level.into());
+            w.lcd_de_idle_pol().bit(config.de_idle_level.into());
+            w.lcd_hs_blank_en().bit(config.hs_blank_en);
             w.lcd_hsync_width()
                 .bits((timing.hsync_width as u8).saturating_sub(1));
             w.lcd_hsync_idle_pol()
-                .bit(config.hsync_idle_polarity.into());
+                .bit(config.hsync_idle_level.into());
             w.lcd_hsync_position()
-                .bits(timing.hsync_position as u8 /* TODO: verify - 1 */)
+                .bits(timing.hsync_position as u8)
         });
 
         lcd_cam.lcd_misc().modify(|_, w| unsafe {
@@ -388,7 +388,8 @@ impl<'d, CH: DmaChannel> Dpi<'d, CH> {
     }
 }
 
-/// TODO
+/// Represents an ongoing (or potentially finished) transfer using the RGB LCD
+/// interface
 pub struct DpiTransfer<'d, BUF: DmaTxBuffer, CH: DmaChannel = AnyDmaChannel> {
     dpi: ManuallyDrop<Dpi<'d, CH>>,
     buffer_view: ManuallyDrop<BUF::View>,
@@ -486,15 +487,22 @@ pub struct Config {
 
     /// TODO
     pub format: Format,
-    /// TODO
+
+    /// Timing settings for the peripheral.
     pub timing: FrameTiming,
 
-    /// TODO
-    pub vsync_idle_polarity: Level,
-    /// TODO
-    pub hsync_idle_polarity: Level,
-    /// TODO
-    pub de_idle_polarity: Level,
+    /// The vsync signal level in IDLE state.
+    pub vsync_idle_level: Level,
+
+    /// The hsync signal level in IDLE state.
+    pub hsync_idle_level: Level,
+
+    /// The de signal level in IDLE state.
+    pub de_idle_level: Level,
+
+    /// If enabled, the hsync pulse will be sent out in vertical blanking lines. i.e. When no valid data is actually sent out.
+    /// Otherwise, hysnc pulses will only be sent out in active region lines.
+    pub hs_blank_en: bool,
 
     /// Disables blank region when LCD sends data out.
     pub disable_black_region: bool,
@@ -515,9 +523,10 @@ impl Default for Config {
             clock_mode: Default::default(),
             format: Default::default(),
             timing: Default::default(),
-            vsync_idle_polarity: Level::Low,
-            hsync_idle_polarity: Level::Low,
-            de_idle_polarity: Level::Low,
+            vsync_idle_level: Level::Low,
+            hsync_idle_level: Level::Low,
+            de_idle_level: Level::Low,
+            hs_blank_en: true,
             disable_black_region: false,
             de_mode: Default::default(),
             hsync_mode: Default::default(),
@@ -527,48 +536,86 @@ impl Default for Config {
     }
 }
 
-/// TODO
+/// Controls how the peripheral should treat data received from the DMA.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Format {
-    /// TODO
+    /// Configures the bit order for data transmission.
     pub bit_order: BitOrder,
-    /// TODO
+
+    /// Configures the byte order for data transmission.
+    ///
+    /// - In 8-bit mode, [ByteOrder::Inverted] means every two bytes are swapped.
+    /// - In 16-bit mode, this controls the byte order (endianness).
     pub byte_order: ByteOrder,
-    /// TODO
+
+    /// If true, the width of the output is 16 bits.
+    /// Otherwise, the width of the output is 8 bits.
     pub enable_2byte_mode: bool,
-    /// TODO
-    pub invert_every_two_bytes: bool,
 }
 
-/// TODO
+/// The timing numbers for the driver to follow.
+///
+///
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct FrameTiming {
-    /// 11 bits
-    pub horizontal_blank_front_porch: usize,
-    /// 10 bits
-    pub vertical_active_height: usize,
-    /// 10 bits
-    pub vertical_total_height: usize,
-
-    /// 8 bits
-    pub vertical_blank_front_porch: usize,
-    /// 12 bits
-    pub horizontal_active_width: usize,
-    /// 12 bits
+    /// The horizontal total width of a frame.
+    ///
+    /// This should be greater than `horizontal_blank_front_porch` + `horizontal_active_width`.
+    ///
+    /// Max is 4096 (12 bits).
     pub horizontal_total_width: usize,
 
-    /// It is the width of LCD_VSYNC active pulse in a line. (7 bits)
+    /// The horizontal blank front porch of a frame.
+    ///
+    /// This is the number of PCLKs between the start of the line and the start of active data in the line.
+    ///
+    /// Note: This includes `hsync_width`.
+    ///
+    /// Max is 2048 (11 bits).
+    pub horizontal_blank_front_porch: usize,
+
+    /// The horizontal active width of a frame. i.e. The number of pixels in a line.
+    /// This is typically the horizontal resolution of the screen.
+    ///
+    /// Max is 4096 (12 bits).
+    pub horizontal_active_width: usize,
+
+    /// The vertical total height of a frame.
+    ///
+    /// This should be greater than `vertical_blank_front_porch` + `vertical_active_height`.
+    ///
+    /// Max is 1024 (10 bits).
+    pub vertical_total_height: usize,
+
+    /// The vertical blank front porch height of a frame.
+    ///
+    /// This is the number of (blank/invalid) lines before the start of the frame.
+    ///
+    /// Note: This includes `vsync_width`.
+    ///
+    /// Max is 256 (8 bits).
+    pub vertical_blank_front_porch: usize,
+
+    /// The vertical active height of a frame. i.e. The number of lines in a frame.
+    /// This is typically the vertical resolution of the screen.
+    ///
+    /// Max is 1024 (10 bits).
+    pub vertical_active_height: usize,
+
+    /// It is the width of LCD_VSYNC active pulse in a line.
+    ///
+    /// Max is 128 (7 bits).
     pub vsync_width: usize,
 
-    /// The width of LCD_HSYNC active pulse in a line. (7 bits)
+    /// The width of LCD_HSYNC active pulse in a line.
+    ///
+    /// Max is 128 (7 bits).
     pub hsync_width: usize,
 
-    /// 1: The pulse of LCD_HSYNC is out in vertical blanking lines.
-    /// 0: LCD_HSYNC pulse is valid only in active region lines
-    pub hs_blank_en: bool,
-
-    /// It is the position of LCD_HSYNC active pulse in a line. (7 bits)
+    /// It is the position of LCD_HSYNC active pulse in a line.
+    ///
+    /// Max is 128 (7 bits).
     pub hsync_position: usize,
 }

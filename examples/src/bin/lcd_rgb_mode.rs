@@ -83,12 +83,11 @@ fn main() -> ! {
             hsync_width: 48, // 1..255
             vsync_width: 3,  // 3..255
 
-            hs_blank_en: true,
             hsync_position: 0,
         },
-        vsync_idle_polarity: Level::High,
-        hsync_idle_polarity: Level::High,
-        de_idle_polarity: Level::Low,
+        vsync_idle_level: Level::High,
+        hsync_idle_level: Level::High,
+        de_idle_level: Level::Low,
         disable_black_region: false,
         ..Default::default()
     };
