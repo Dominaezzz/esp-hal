@@ -15,7 +15,7 @@ use fugit::HertzU32;
 
 use crate::{
     clock::Clocks,
-    dma::{AnyDmaChannel, ChannelTx, DmaChannel, DmaError, DmaPeripheral, DmaTxBuffer, Tx},
+    dma::{ChannelTx, DmaChannelConvert, DmaEligible, DmaError, DmaPeripheral, DmaTxBuffer, Tx},
     gpio::{Level, OutputSignal, PeripheralOutput},
     lcd_cam::{
         lcd::{ClockMode, DelayMode, Lcd, Phase, Polarity},
@@ -29,19 +29,22 @@ use crate::{
 };
 
 /// Represents the RGB LCD interface.
-pub struct Dpi<'d, CH: DmaChannel = AnyDmaChannel> {
+pub struct Dpi<'d> {
     lcd_cam: PeripheralRef<'d, LCD_CAM>,
-    tx_channel: ChannelTx<'d, CH>,
+    tx_channel: ChannelTx<'d, <LCD_CAM as DmaEligible>::Dma>,
 }
 
-impl<'d, CH: DmaChannel> Dpi<'d, CH> {
+impl<'d> Dpi<'d> {
     /// Create a new instance of the RGB/DPI driver.
-    pub fn new<DM: Mode>(
+    pub fn new<DM: Mode, CH>(
         lcd: Lcd<'d, DM>,
         channel: ChannelTx<'d, CH>,
         frequency: HertzU32,
         config: Config,
-    ) -> Self {
+    ) -> Self
+    where
+        CH: DmaChannelConvert<<LCD_CAM as DmaEligible>::Dma>,
+    {
         let lcd_cam = lcd.lcd_cam;
 
         let clocks = Clocks::get();
@@ -117,16 +120,13 @@ impl<'d, CH: DmaChannel> Dpi<'d, CH> {
         lcd_cam.lcd_ctrl2().modify(|_, w| unsafe {
             w.lcd_vsync_width()
                 .bits((timing.vsync_width as u8).saturating_sub(1));
-            w.lcd_vsync_idle_pol()
-                .bit(config.vsync_idle_level.into());
+            w.lcd_vsync_idle_pol().bit(config.vsync_idle_level.into());
             w.lcd_de_idle_pol().bit(config.de_idle_level.into());
             w.lcd_hs_blank_en().bit(config.hs_blank_en);
             w.lcd_hsync_width()
                 .bits((timing.hsync_width as u8).saturating_sub(1));
-            w.lcd_hsync_idle_pol()
-                .bit(config.hsync_idle_level.into());
-            w.lcd_hsync_position()
-                .bits(timing.hsync_position as u8)
+            w.lcd_hsync_idle_pol().bit(config.hsync_idle_level.into());
+            w.lcd_hsync_position().bits(timing.hsync_position as u8)
         });
 
         lcd_cam.lcd_misc().modify(|_, w| unsafe {
@@ -174,7 +174,7 @@ impl<'d, CH: DmaChannel> Dpi<'d, CH> {
 
         Self {
             lcd_cam,
-            tx_channel: channel,
+            tx_channel: channel.degrade(),
         }
     }
 
@@ -351,7 +351,7 @@ impl<'d, CH: DmaChannel> Dpi<'d, CH> {
         mut self,
         next_frame_en: bool,
         mut buf: TX,
-    ) -> Result<DpiTransfer<'d, TX, CH>, (DmaError, Self, TX)> {
+    ) -> Result<DpiTransfer<'d, TX>, (DmaError, Self, TX)> {
         let result = unsafe {
             self.tx_channel
                 .prepare_transfer(DmaPeripheral::LcdCam, &mut buf)
@@ -390,12 +390,12 @@ impl<'d, CH: DmaChannel> Dpi<'d, CH> {
 
 /// Represents an ongoing (or potentially finished) transfer using the RGB LCD
 /// interface
-pub struct DpiTransfer<'d, BUF: DmaTxBuffer, CH: DmaChannel = AnyDmaChannel> {
-    dpi: ManuallyDrop<Dpi<'d, CH>>,
+pub struct DpiTransfer<'d, BUF: DmaTxBuffer> {
+    dpi: ManuallyDrop<Dpi<'d>>,
     buffer_view: ManuallyDrop<BUF::View>,
 }
 
-impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> DpiTransfer<'d, BUF, CH> {
+impl<'d, BUF: DmaTxBuffer> DpiTransfer<'d, BUF> {
     /// Returns true when [Self::wait] will not block.
     pub fn is_done(&self) -> bool {
         self.dpi
@@ -407,7 +407,7 @@ impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> DpiTransfer<'d, BUF, CH> {
     }
 
     /// Stops this transfer on the spot and returns the peripheral and buffer.
-    pub fn stop(mut self) -> (Dpi<'d, CH>, BUF) {
+    pub fn stop(mut self) -> (Dpi<'d>, BUF) {
         self.stop_peripherals();
         let (dpi, view) = self.release();
         (dpi, BUF::from_view(view))
@@ -417,7 +417,7 @@ impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> DpiTransfer<'d, BUF, CH> {
     ///
     /// Note: If you specified `next_frame_en` as true in [Dpi::send], you're
     /// just waiting for a DMA error when you call this.
-    pub fn wait(self) -> (Result<(), DmaError>, Dpi<'d, CH>, BUF) {
+    pub fn wait(self) -> (Result<(), DmaError>, Dpi<'d>, BUF) {
         while !self.is_done() {
             core::hint::spin_loop();
         }
@@ -434,7 +434,7 @@ impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> DpiTransfer<'d, BUF, CH> {
         (result, dpi, BUF::from_view(view))
     }
 
-    fn release(mut self) -> (Dpi<'d, CH>, BUF::View) {
+    fn release(mut self) -> (Dpi<'d>, BUF::View) {
         // SAFETY: Since forget is called on self, we know that self.camera and
         // self.buffer_view won't be touched again.
         let result = unsafe {
@@ -458,7 +458,7 @@ impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> DpiTransfer<'d, BUF, CH> {
     }
 }
 
-impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> Deref for DpiTransfer<'d, BUF, CH> {
+impl<'d, BUF: DmaTxBuffer> Deref for DpiTransfer<'d, BUF> {
     type Target = BUF::View;
 
     fn deref(&self) -> &Self::Target {
@@ -466,13 +466,13 @@ impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> Deref for DpiTransfer<'d, BUF, CH> {
     }
 }
 
-impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> DerefMut for DpiTransfer<'d, BUF, CH> {
+impl<'d, BUF: DmaTxBuffer> DerefMut for DpiTransfer<'d, BUF> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.buffer_view
     }
 }
 
-impl<'d, BUF: DmaTxBuffer, CH: DmaChannel> Drop for DpiTransfer<'d, BUF, CH> {
+impl<'d, BUF: DmaTxBuffer> Drop for DpiTransfer<'d, BUF> {
     fn drop(&mut self) {
         self.stop_peripherals();
     }
@@ -500,8 +500,9 @@ pub struct Config {
     /// The de signal level in IDLE state.
     pub de_idle_level: Level,
 
-    /// If enabled, the hsync pulse will be sent out in vertical blanking lines. i.e. When no valid data is actually sent out.
-    /// Otherwise, hysnc pulses will only be sent out in active region lines.
+    /// If enabled, the hsync pulse will be sent out in vertical blanking lines.
+    /// i.e. When no valid data is actually sent out. Otherwise, hysnc
+    /// pulses will only be sent out in active region lines.
     pub hs_blank_en: bool,
 
     /// Disables blank region when LCD sends data out.
@@ -545,7 +546,8 @@ pub struct Format {
 
     /// Configures the byte order for data transmission.
     ///
-    /// - In 8-bit mode, [ByteOrder::Inverted] means every two bytes are swapped.
+    /// - In 8-bit mode, [ByteOrder::Inverted] means every two bytes are
+    ///   swapped.
     /// - In 16-bit mode, this controls the byte order (endianness).
     pub byte_order: ByteOrder,
 
@@ -555,51 +557,53 @@ pub struct Format {
 }
 
 /// The timing numbers for the driver to follow.
-///
-///
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct FrameTiming {
     /// The horizontal total width of a frame.
     ///
-    /// This should be greater than `horizontal_blank_front_porch` + `horizontal_active_width`.
+    /// This should be greater than `horizontal_blank_front_porch` +
+    /// `horizontal_active_width`.
     ///
     /// Max is 4096 (12 bits).
     pub horizontal_total_width: usize,
 
     /// The horizontal blank front porch of a frame.
     ///
-    /// This is the number of PCLKs between the start of the line and the start of active data in the line.
+    /// This is the number of PCLKs between the start of the line and the start
+    /// of active data in the line.
     ///
     /// Note: This includes `hsync_width`.
     ///
     /// Max is 2048 (11 bits).
     pub horizontal_blank_front_porch: usize,
 
-    /// The horizontal active width of a frame. i.e. The number of pixels in a line.
-    /// This is typically the horizontal resolution of the screen.
+    /// The horizontal active width of a frame. i.e. The number of pixels in a
+    /// line. This is typically the horizontal resolution of the screen.
     ///
     /// Max is 4096 (12 bits).
     pub horizontal_active_width: usize,
 
     /// The vertical total height of a frame.
     ///
-    /// This should be greater than `vertical_blank_front_porch` + `vertical_active_height`.
+    /// This should be greater than `vertical_blank_front_porch` +
+    /// `vertical_active_height`.
     ///
     /// Max is 1024 (10 bits).
     pub vertical_total_height: usize,
 
     /// The vertical blank front porch height of a frame.
     ///
-    /// This is the number of (blank/invalid) lines before the start of the frame.
+    /// This is the number of (blank/invalid) lines before the start of the
+    /// frame.
     ///
     /// Note: This includes `vsync_width`.
     ///
     /// Max is 256 (8 bits).
     pub vertical_blank_front_porch: usize,
 
-    /// The vertical active height of a frame. i.e. The number of lines in a frame.
-    /// This is typically the vertical resolution of the screen.
+    /// The vertical active height of a frame. i.e. The number of lines in a
+    /// frame. This is typically the vertical resolution of the screen.
     ///
     /// Max is 1024 (10 bits).
     pub vertical_active_height: usize,
