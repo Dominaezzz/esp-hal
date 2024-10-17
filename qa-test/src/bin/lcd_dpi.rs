@@ -29,12 +29,11 @@
 #![no_std]
 #![no_main]
 
-use core::iter::{empty, once};
+use core::iter::once;
 
 use esp_backtrace as _;
 use esp_hal::{
     delay::Delay,
-    dma_loop_buffer,
     gpio::{Level, Output, OutputConfig},
     i2c::{self, master::I2c},
     lcd_cam::{
@@ -51,7 +50,9 @@ use esp_hal::{
     time::Rate,
     Blocking,
 };
+use esp_hal::dma::{DmaDescriptor, DmaTxStreamBuf};
 use esp_println::println;
+use static_cell::ConstStaticCell;
 
 #[main]
 fn main() -> ! {
@@ -133,7 +134,12 @@ fn main() -> ! {
     }
     drop(vsync_must_be_high_during_setup);
 
-    let mut dma_buf = dma_loop_buffer!(2 * 16);
+    // let mut dma_buf = dma_loop_buffer!(2 * 16);
+
+    static DESCRIPTORS: ConstStaticCell<[DmaDescriptor; 100]> = ConstStaticCell::new([DmaDescriptor::EMPTY; 100]);
+    static BUFFER: ConstStaticCell<[u8; 100_000]> = ConstStaticCell::new([0; 100_000]);
+
+    let mut dma_stream_buf = DmaTxStreamBuf::new(DESCRIPTORS.take(), BUFFER.take()).unwrap();
 
     let config = Config::default()
         .with_clock_mode(ClockMode {
@@ -164,7 +170,7 @@ fn main() -> ! {
         .with_de_idle_level(Level::Low)
         .with_disable_black_region(false);
 
-    let mut dpi = Dpi::new(lcd_cam.lcd, tx_channel, config)
+    let dpi = Dpi::new(lcd_cam.lcd, tx_channel, config)
         .unwrap()
         .with_vsync(vsync_pin)
         .with_hsync(peripherals.GPIO46)
@@ -190,41 +196,97 @@ fn main() -> ! {
         .with_data14(peripherals.GPIO2)
         .with_data15(peripherals.GPIO1);
 
-    const MAX_RED: u16 = (1 << 5) - 1;
-    const MAX_GREEN: u16 = (1 << 6) - 1;
-    const MAX_BLUE: u16 = (1 << 5) - 1;
+    // const MAX_RED: u16 = (1 << 5) - 1;
+    // const MAX_GREEN: u16 = (1 << 6) - 1;
+    // const MAX_BLUE: u16 = (1 << 5) - 1;
 
-    fn rgb(r: u16, g: u16, b: u16) -> u16 {
-        (r << 11) | (g << 5) | (b << 0)
+    // fn rgb(r: u16, g: u16, b: u16) -> u16 {
+    //     (r << 11) | (g << 5) | (b << 0)
+    // }
+    //
+    // let mut colors = empty()
+    //     // Start with red and gradually add green
+    //     .chain((0..=MAX_GREEN).map(|g| rgb(MAX_RED, g, 0)))
+    //     // Then remove the red
+    //     .chain((0..=MAX_RED).rev().map(|r| rgb(r, MAX_GREEN, 0)))
+    //     // Then add blue
+    //     .chain((0..=MAX_BLUE).map(|b| rgb(0, MAX_GREEN, b)))
+    //     // Then remove green
+    //     .chain((0..=MAX_GREEN).rev().map(|g| rgb(0, g, MAX_BLUE)))
+    //     // Then add red
+    //     .chain((0..=MAX_RED).map(|r| rgb(r, 0, MAX_BLUE)))
+    //     // Then remove blue
+    //     .chain((0..=MAX_BLUE).rev().map(|b| rgb(MAX_RED, 0, b)))
+    //     // Once we get we have red, and we can start again.
+    //     .cycle();
+
+    let mut buffer = [0; 5000];
+    for chunk in buffer.chunks_mut(2) {
+        let color: u16 = 0b11111_000000_00000;
+        chunk.copy_from_slice(&color.to_le_bytes());
+    }
+    let mut buffer2 = [0; 5000];
+    for chunk in buffer2.chunks_mut(2) {
+        let color: u16 = 0b00000_000000_11111;
+        chunk.copy_from_slice(&color.to_le_bytes());
     }
 
-    let mut colors = empty()
-        // Start with red and gradually add green
-        .chain((0..=MAX_GREEN).map(|g| rgb(MAX_RED, g, 0)))
-        // Then remove the red
-        .chain((0..=MAX_RED).rev().map(|r| rgb(r, MAX_GREEN, 0)))
-        // Then add blue
-        .chain((0..=MAX_BLUE).map(|b| rgb(0, MAX_GREEN, b)))
-        // Then remove green
-        .chain((0..=MAX_GREEN).rev().map(|g| rgb(0, g, MAX_BLUE)))
-        // Then add red
-        .chain((0..=MAX_RED).map(|r| rgb(r, 0, MAX_BLUE)))
-        // Then remove blue
-        .chain((0..=MAX_BLUE).rev().map(|b| rgb(MAX_RED, 0, b)))
-        // Once we get we have red, and we can start again.
-        .cycle();
+    println!("Buffering");
 
-    println!("Rendering");
+    let mut total_bytes_pushed = 0;
     loop {
-        let transfer = dpi.send(false, dma_buf).map_err(|e| e.0).unwrap();
-        (_, dpi, dma_buf) = transfer.wait();
-
-        if let Some(color) = colors.next() {
-            for chunk in dma_buf.chunks_mut(2) {
-                chunk.copy_from_slice(&color.to_le_bytes());
-            }
+        let bytes_pushed = dma_stream_buf.push(&buffer);
+        total_bytes_pushed += bytes_pushed;
+        if bytes_pushed < buffer.len() {
+            break
         }
     }
+
+    println!("Rendering");
+
+    const FRAME_SIZE: usize = 480 * 480 * 2;
+
+    let mut transfer = dpi.send(true, dma_stream_buf).map_err(|e| e.0).unwrap();
+    let mut count = 0;
+    let mut is_buffer2 = false;
+    loop {
+        let buffer = if is_buffer2 {
+            buffer
+        } else {
+            buffer2
+        };
+        let mut remaining = FRAME_SIZE - total_bytes_pushed;
+        total_bytes_pushed = 0;
+        loop {
+            let buf = if buffer.len() > remaining {
+                &buffer[..remaining]
+            } else {
+                &buffer
+            };
+            let bytes_pushed = transfer.push(buf, false);
+            remaining -= bytes_pushed;
+            if remaining == 0 {
+                break
+            }
+        }
+
+        count += 1;
+        if count > 50 {
+            count = 0;
+            is_buffer2 = !is_buffer2;
+        }
+    }
+
+    // loop {
+    //     let transfer = dpi.send(false, dma_buf).map_err(|e| e.0).unwrap();
+    //     (_, dpi, dma_buf) = transfer.wait();
+    //
+    //     if let Some(color) = colors.next() {
+    //         for chunk in dma_buf.chunks_mut(2) {
+    //             chunk.copy_from_slice(&color.to_le_bytes());
+    //         }
+    //     }
+    // }
 }
 
 struct Tca9554 {
